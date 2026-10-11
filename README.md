@@ -22,7 +22,7 @@ The same app is in the RouteHash community store: [github.com/RouteHash-com/umbr
 
 In Umbrel: **Settings → App stores → Add a community app store** and paste that URL. Install **Blake2b Pool Balance**. It does not replace **RouteHash Gateway**.
 
-Copy says **beta** until a live Umbrel install is confirmed. The store pins `ghcr.io/routehash-com/blake2b-pool-balance:0.1.0`. This repository is the image source. The store compose has no `build` key, because Umbrel builds from the wrong path when a service has both `build` and `image`.
+Copy says **beta** until a live Umbrel install is confirmed. The store app includes the Dockerfile and builds on install. It does not set both `build` and `image`, because Umbrel builds from the wrong path when a service has both.
 
 ## Build
 
