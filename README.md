@@ -1,6 +1,12 @@
 # Blake2b Pool Balance (StartOS)
 
-Opt-in chooser for a Blake2b DATUM Pool Host. Package id `blake2b-pool-balance`. Title **Blake2b Pool Balance**. Version `0.1.0:0`. Icon is `icon.svg` only.
+Blake2b Pool Balance is for a person who already mines Blake2b through their own DATUM gateway and does not want one pool to hold more of the XBT network than they are willing to help it hold.
+
+About once a minute it reads the pools that have published a size limit. When the pool this gateway is on would pass the share this machine will help one pool hold, it moves Pool Host to a pool that still has room. That share starts at 30 percent of global XBT hashrate. House Pool is the last stop, already filled in as `pool.routehash.com:28915`, so the rig keeps hashing when every other pool is full. A pool operator uses the other card on the same page to publish that pool's own limit. Only this gateway moves, and only after you turn that on.
+
+This StartOS download is the 64-bit package for an AMD or Intel server, `blake2b-pool-balance_x86_64.s9pk`. A Raspberry Pi running StartOS does not have this package in this release. A Raspberry Pi running Umbrel installs it from the RouteHash store, which builds the app on that Pi: [github.com/RouteHash-com/umbrel-store](https://github.com/RouteHash-com/umbrel-store).
+
+Package id `blake2b-pool-balance`. Title **Blake2b Pool Balance**. Version `0.1.0:0`. Icon is `icon.svg` only.
 
 It sits beside the DATUM gateway you already run. It does not replace `datum` or `routehash-gateway`. It does not install DATUM, it does not ship Knots, and it does not listen for ASICs. Your ASICs stay on the miner port of the gateway you already use. Never put port 28915 on an ASIC.
 
