@@ -405,15 +405,32 @@ class ResolvedCap:
         return self.prime_tag or self.block_tag
 
 
+def _inconsistent_cap(pubkey, listing):
+    return ResolvedCap(
+        pubkey=pubkey,
+        host=listing.host,
+        port=int(listing.port),
+        block_tag=listing.block_tag,
+        prime_pubkey=listing.prime_pubkey,
+        prime_tag=listing.prime_tag,
+        receive=False,
+        percent=None,
+        capacity_th=0.0,
+        consistent=False,
+    )
+
+
 def effective_caps(announcements, now, listings=None):
     """Lowest unexpired percent and capacity for each pool pubkey.
 
-    Host, port, and tags must agree across the unexpired set. A disagreement
-    marks the cap inconsistent so it cannot be an overflow target. When a
-    current listing is passed, a cap that does not match it is also
-    inconsistent. An older cap therefore keeps the pool off the move list
-    until it expires, including after the owner changes host. Pass listings
-    as None when there is no pool list. An empty list does not add that rule.
+    Host, port, and tags must agree across the caps that still count. A
+    disagreement marks the cap inconsistent so it cannot be an overflow
+    target. When a current listing is passed, a cap that names a different
+    host, port, or tag is ignored. The newest listing then wins the same
+    day. A listing with no matching cap, or a removed listing, is not a
+    target. Pass listings as None when there is no pool list. An empty
+    list does not add that rule. Among caps that still count, the lowest
+    percent and the lowest positive capacity apply.
     """
     catalog = current_listings(listings, now) if listings is not None else None
     grouped = {}
@@ -424,6 +441,18 @@ def effective_caps(announcements, now, listings=None):
         grouped.setdefault(payload["pool_pubkey"], []).append(payload)
     resolved = {}
     for pubkey, rows in grouped.items():
+        listing = catalog.get(pubkey) if catalog is not None else None
+        if listing is not None:
+            if listing.removed:
+                resolved[pubkey] = _inconsistent_cap(pubkey, listing)
+                continue
+            matched = [row for row in rows if _listing_matches(row, listing)]
+            if rows and not matched:
+                resolved[pubkey] = _inconsistent_cap(pubkey, listing)
+                continue
+            rows = matched
+        if not rows:
+            continue
         identity = {
             (row["pool_host"], row["pool_port"], row["block_tag"], row["prime_pubkey"], row["prime_tag"])
             for row in rows
@@ -433,12 +462,7 @@ def effective_caps(announcements, now, listings=None):
         percent = min(percents) if percents else None
         capacities = [float(row["capacity_th"]) for row in rows if float(row["capacity_th"]) > 0]
         capacity = min(capacities) if capacities else 0.0
-        sample = rows[0]
-        consistent = len(identity) == 1
-        if catalog is not None and pubkey in catalog:
-            listing = catalog[pubkey]
-            if listing.removed or any(not _listing_matches(row, listing) for row in rows):
-                consistent = False
+        sample = max(rows, key=lambda row: (row["created_at"], row["expires_at"]))
         resolved[pubkey] = ResolvedCap(
             pubkey=pubkey,
             host=sample["pool_host"],
@@ -449,7 +473,7 @@ def effective_caps(announcements, now, listings=None):
             receive=receive and percent is not None,
             percent=percent,
             capacity_th=capacity,
-            consistent=consistent,
+            consistent=len(identity) == 1,
         )
     return resolved
 

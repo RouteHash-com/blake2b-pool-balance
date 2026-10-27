@@ -3,9 +3,10 @@
 
 Reads /data/chooser.json. Writes Pool Host only when that file names a
 gateway address and admin password. A file named pin in the data
-directory holds Pool Host still. Pool size comes from mempool.guide.
-The network total comes from the node RPC in the config when that call
-works, and from mempool.guide otherwise. A samples.json file is not read.
+directory holds Pool Host still. XBT pool size comes from mempool.guide.
+XBTC pool size comes from mempool.xbtcash.org. The network total for the
+chain named on the node comes from that node RPC when the call works,
+and from the matching explorer otherwise. A samples.json file is not read.
 
 Does not start with the RouteHash web app or proxy.
 """
@@ -26,12 +27,15 @@ from pool_announce import (
     public_identity,
     sign_announcement,
     sign_listing,
+    tighter_percent,
 )
-from pool_balance import parse_balance_percent
-from pool_chooser import ceiling_refused, run_once
+from pool_balance import _new_fits, effective_max_th, parse_balance_percent
+from pool_chooser import ceiling_refused, local_ceiling, run_once
 from pool_gateway import DatumGatewayClient
 
 LOOP_SECONDS = 60
+RENEW_AFTER_SECONDS = 12 * 60 * 60
+RENEW_RETRY_SECONDS = 10 * 60
 _UI_LIMIT = 65536
 HOUSE_HOST = "pool.routehash.com"
 HOUSE_PORT = 28915
@@ -128,6 +132,7 @@ def normalize_config(raw):
             "url": str(node.get("url") or "").strip(),
             "user": str(node.get("user") or "").strip(),
             "password": str(node.get("password") or ""),
+            "chain": "xbtc" if str(node.get("chain") or "").strip().lower() == "xbtc" else "xbt",
         },
     }
 
@@ -257,11 +262,74 @@ def _publish_record(fields, ok, message):
     return record
 
 
+def _remove_published_pool(data_dir, identity, relays, moment, websocket_factory, finish, fields):
+    """Delete the cap and listing for this pool from the relays.
+
+    A new cap does not replace the old one, so Remove sends a deletion for
+    the events this service already published. The row leaves the table on
+    the next read.
+    """
+    from pool_publish import (
+        fetch_cap_events,
+        load_or_create_transport_key,
+        pool_events_to_delete,
+        publish_deletion,
+    )
+
+    try:
+        pubkey = public_identity(identity)
+    except ValueError as exc:
+        return finish(False, _SIGN_ERRORS.get(str(exc), "The DATUM identity must be 320 hex characters."))
+    try:
+        transport = load_or_create_transport_key(Path(data_dir) / "transport-key.json")
+    except (OSError, ValueError, json.JSONDecodeError):
+        return finish(False, "The local transport key could not be read.")
+    factory = websocket_factory
+    if factory is None:
+        from websocket import create_connection
+        factory = create_connection
+    events, errors = fetch_cap_events(relays, factory)
+    if errors and not events:
+        return finish(False, "The relays could not be read.")
+    targets, foreign = pool_events_to_delete(events, pubkey, transport["public_key"])
+    if not targets:
+        if foreign:
+            return finish(False, "That cap was published by a different relay key. This service cannot delete it.")
+        return finish(False, "No cap for this pool was found on those relays.")
+    try:
+        _event, results = publish_deletion(
+            targets, relays, transport["private_key"], factory, now=moment,
+        )
+    except ValueError:
+        return finish(False, "The removal was not sent.")
+    accepted_count = sum(1 for row in results if row.get("accepted"))
+    if accepted_count < 1:
+        return finish(False, "No relay accepted the removal.")
+    snapshot = {
+        "name": fields.get("name") or "",
+        "host": fields.get("host") or "",
+        "port": fields.get("port") or 28915,
+        "tag": fields.get("tag") or "",
+        "percent": fields.get("percent") or "",
+        "capacity": fields.get("capacity") or "",
+        "stats_url": fields.get("stats_url") or "",
+        "relays": list(relays),
+        "signed_at": moment,
+        "removed": True,
+    }
+    return finish(
+        True,
+        "Removal accepted by %s of %s relays. Every cap this machine signed for this pool was deleted."
+        % (accepted_count, len(results)),
+        {"accepted": snapshot, "renew_not_before": 0},
+    )
+
+
 def publish_pool(data_dir, form, config, now=None, websocket_factory=None):
     """Sign one cap and, only after a relay accepts it, the matching listing.
 
     The private identity is stored beside the config and is not returned.
-    A remove still sends a cap first, with receiving turned off.
+    Remove deletes the caps and listings this service already published.
     """
     config = normalize_config(config)
     moment = int(time.time() if now is None else now)
@@ -293,8 +361,17 @@ def publish_pool(data_dir, form, config, now=None, websocket_factory=None):
         "relays": relays or relay_lines,
     }
 
-    def finish(ok, message):
+    def finish(ok, message, extra=None):
+        previous = _load(Path(data_dir) / _PUBLISH_FILE, {})
+        if not isinstance(previous, dict):
+            previous = {}
         record = _publish_record(fields, ok, message)
+        if isinstance(previous.get("accepted"), dict):
+            record["accepted"] = previous["accepted"]
+        if previous.get("renew_not_before"):
+            record["renew_not_before"] = previous["renew_not_before"]
+        if extra:
+            record.update(extra)
         _save(Path(data_dir) / _PUBLISH_FILE, record, private=True)
         return record
 
@@ -308,6 +385,12 @@ def publish_pool(data_dir, form, config, now=None, websocket_factory=None):
         identity = _read_identity(data_dir)
     if not identity:
         return finish(False, "The signing key is the file ratum-prime.key in the RATUM Prime service data. The public pool key cannot sign a cap. Leave this blank if you only run a gateway.")
+    if not relays:
+        return finish(False, "Add at least one ws:// or wss:// relay.")
+    if remove:
+        return _remove_published_pool(
+            data_dir, identity, relays, moment, websocket_factory, finish, fields,
+        )
     if not host or not tag or not (1 <= port <= 65535):
         return finish(False, "Set the pool host, a port from 1 to 65535, and the coinbase tag.")
     percent = parse_balance_percent(percent_text)
@@ -322,8 +405,6 @@ def publish_pool(data_dir, form, config, now=None, websocket_factory=None):
             return finish(False, "Capacity TH/s must be a number.")
         if capacity < 0:
             return finish(False, "Capacity TH/s cannot be below zero.")
-    if not relays:
-        return finish(False, "Add at least one ws:// or wss:// relay.")
     try:
         pubkey = public_identity(identity)
     except ValueError as exc:
@@ -392,11 +473,192 @@ def publish_pool(data_dir, form, config, now=None, websocket_factory=None):
             False,
             f"The cap was accepted by {cap_ok} of {total} relays. No relay accepted the listing.",
         )
-    verb = "Removal" if remove else "Cap and listing"
-    return finish(True, f"{verb} accepted by {list_ok} of {total} relays. The cap went first.")
+    accepted = {
+        "name": name,
+        "host": host,
+        "port": port,
+        "tag": tag,
+        "percent": "" if remove else percent_text,
+        "capacity": raw_capacity,
+        "stats_url": stats_url,
+        "relays": relays,
+        "signed_at": created,
+        "removed": remove,
+    }
+    return finish(
+        True,
+        "Cap and listing accepted by %s of %s relays for %s:%s. The cap went first."
+        % (list_ok, total, host, port),
+        {"accepted": accepted, "renew_not_before": 0},
+    )
 
 
-def catalog_rows(cache, now=None):
+def _accepted_publish(record):
+    """Last signature this machine should keep alive. A removal stays removed."""
+    if not isinstance(record, dict):
+        return None
+    accepted = record.get("accepted")
+    if isinstance(accepted, dict):
+        if accepted.get("removed") or not str(accepted.get("host") or "").strip():
+            return None
+        return accepted
+    if not record.get("ok") or str(record.get("message") or "").startswith("Removal"):
+        return None
+    host = str(record.get("host") or "").strip()
+    if not host:
+        return None
+    relays = record.get("relays")
+    return {
+        "name": record.get("name") or "",
+        "host": host,
+        "port": record.get("port"),
+        "tag": record.get("tag") or "",
+        "percent": record.get("percent") or "",
+        "capacity": record.get("capacity") or "",
+        "stats_url": record.get("stats_url") or "",
+        "relays": relays if isinstance(relays, list) else [],
+        "signed_at": int(record.get("signed_at") or 0),
+        "removed": False,
+    }
+
+
+def renew_saved_pool(data_dir, now=None, websocket_factory=None):
+    """Sign the last accepted publish again before its cap expires.
+
+    Called about once a minute. A new signature goes out when the last one
+    is 12 hours old. A removal is left in place. A failed send waits 10
+    minutes and does not replace the last accepted cap.
+    """
+    moment = int(time.time() if now is None else now)
+    path = Path(data_dir) / _PUBLISH_FILE
+    record = _load(path, {})
+    accepted = _accepted_publish(record)
+    if accepted is None or not _read_identity(data_dir):
+        return None
+    signed_at = int(accepted.get("signed_at") or 0)
+    if signed_at and moment < signed_at + RENEW_AFTER_SECONDS:
+        return None
+    if isinstance(record, dict):
+        not_before = int(record.get("renew_not_before") or 0)
+        if not_before and moment < not_before:
+            return None
+    relays = accepted.get("relays") or []
+    form = {
+        "form": ["publish"],
+        "pool_identity": [""],
+        "pool_name": [str(accepted.get("name") or "")],
+        "pool_host": [str(accepted.get("host") or "")],
+        "pool_port": [str(accepted.get("port") or "")],
+        "pool_tag": [str(accepted.get("tag") or "")],
+        "pool_percent": [str(accepted.get("percent") or "")],
+        "pool_capacity": [str(accepted.get("capacity") or "")],
+        "pool_stats_url": [str(accepted.get("stats_url") or "")],
+        "pool_relays": ["\n".join(str(item) for item in relays)],
+    }
+    config = normalize_config(_load(Path(data_dir) / "chooser.json", {}))
+    result = publish_pool(
+        data_dir, form, config, now=moment, websocket_factory=websocket_factory,
+    )
+    saved = _load(path, {})
+    if not isinstance(saved, dict):
+        saved = {}
+    if result.get("ok"):
+        saved["message"] = "Renewed. " + str(saved.get("message") or "")
+        _save(path, saved, private=True)
+        return {"renewed": True}
+    saved["renew_not_before"] = moment + RENEW_RETRY_SECONDS
+    if isinstance(saved.get("accepted"), dict) and not saved["accepted"].get("removed"):
+        saved["ok"] = True
+        saved["message"] = "Renewal did not reach a relay. The last accepted cap is unchanged."
+        for key in ("name", "host", "port", "tag", "percent", "capacity", "stats_url", "relays"):
+            if key in saved["accepted"]:
+                saved[key] = saved["accepted"][key]
+    _save(path, saved, private=True)
+    return {"renewed": False}
+
+
+def _sample_chain(tag, samples):
+    chain = str(((samples or {}).get("pool_chain") or {}).get(tag) or "")
+    return chain if chain in {"xbt", "xbtc"} else ""
+
+
+def _sample_network(chain, samples):
+    if not chain:
+        return None
+    try:
+        number = float(((samples or {}).get("chains") or {}).get(chain))
+    except (TypeError, ValueError):
+        return None
+    if number <= 0:
+        return None
+    return number
+
+
+def _sample_pool_th(tag, samples):
+    try:
+        number = float(((samples or {}).get("pools") or {}).get(tag))
+    except (TypeError, ValueError):
+        return None
+    if number < 0:
+        return None
+    return number
+
+
+def _th_text(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if number < 0:
+        return ""
+    return "%.2f TH/s" % number
+
+
+def _cap_detail(cap, samples, rig_th, ceiling):
+    tag = getattr(cap, "charge_tag", "") if cap is not None else ""
+    pool_th = _sample_pool_th(tag, samples) if tag else None
+    pool_text = _th_text(pool_th) if pool_th is not None else ""
+    if cap is None or not cap.consistent or not cap.receive or cap.percent is None:
+        return pool_text, ""
+    chain = _sample_chain(cap.charge_tag, samples)
+    network = _sample_network(chain, samples)
+    if network is None:
+        return pool_text, ""
+    percent = tighter_percent(cap.percent, local_ceiling(ceiling))
+    max_th = effective_max_th(True, percent, cap.capacity_th, network)
+    parts = []
+    if max_th is not None:
+        parts.append("Cap is %.2f TH" % max_th)
+    try:
+        rig = float(rig_th or 0)
+    except (TypeError, ValueError):
+        rig = 0.0
+    if rig > 0 and pool_th is not None and max_th is not None:
+        fits, _room = _new_fits(rig, max_th, pool_th, 0)
+        if fits:
+            parts.append("Your rig fits")
+        else:
+            parts.append("Your rig would put this pool over its cap")
+    return pool_text, ". ".join(parts)
+
+
+def _row_note(pubkey, host, port, ours_pubkey, accepted):
+    notes = []
+    ours = bool(ours_pubkey) and str(pubkey or "").lower() == str(ours_pubkey).lower()
+    if ours:
+        notes.append("This machine")
+    saved_host = str((accepted or {}).get("host") or "").strip().lower()
+    if ours and saved_host:
+        try:
+            saved_port = int(accepted.get("port"))
+        except (TypeError, ValueError):
+            saved_port = 0
+        if saved_host != str(host or "").strip().lower() or saved_port != int(port or 0):
+            notes.append("An older host is still on the relay")
+    return ". ".join(notes)
+
+
+def catalog_rows(cache, now=None, samples=None, rig_th=0, ceiling=None, ours_pubkey="", accepted=None):
     """Pools from the last relay read. A stats URL in a listing is not fetched."""
     moment = int(time.time() if now is None else now)
     events = []
@@ -416,20 +678,31 @@ def catalog_rows(cache, now=None):
     )
     rows = []
     seen = set()
+
+    def add(pubkey, name, host, port, tag, removed, cap):
+        pool_text, detail = _cap_detail(cap, samples, rig_th, ceiling)
+        chain = _sample_chain(getattr(cap, "charge_tag", "") or tag, samples) if cap is not None else _sample_chain(tag, samples)
+        rows.append(_catalog_row(
+            name, host, port, tag, removed, cap,
+            chain=chain,
+            pool_th=pool_text,
+            detail=detail,
+            note=_row_note(pubkey, host, port, ours_pubkey, accepted),
+            pubkey=pubkey,
+        ))
+
     for pubkey, listing in listings.items():
         seen.add(pubkey)
-        rows.append(_catalog_row(
-            listing.name,
-            listing.host,
-            listing.port,
-            listing.block_tag,
-            listing.removed,
-            caps.get(pubkey),
-        ))
-    for _pubkey, cap in caps.items():
-        if _pubkey in seen:
+        if listing.removed:
             continue
-        rows.append(_catalog_row(cap.host, cap.host, cap.port, cap.block_tag, False, cap))
+        add(
+            pubkey, listing.name, listing.host, listing.port, listing.block_tag,
+            listing.removed, caps.get(pubkey),
+        )
+    for pubkey, cap in caps.items():
+        if pubkey in seen:
+            continue
+        add(pubkey, "", cap.host, cap.port, cap.block_tag, False, cap)
     rows.sort(key=lambda row: (str(row["name"]).lower(), str(row["host"]).lower(), int(row["port"])))
     return rows
 
@@ -442,7 +715,7 @@ def _percent_text(value):
     return ("%.4f" % number).rstrip("0").rstrip(".")
 
 
-def _catalog_row(name, host, port, tag, removed, cap):
+def _catalog_row(name, host, port, tag, removed, cap, chain="", pool_th="", detail="", note="", pubkey=""):
     if removed:
         cap_text = "Removed"
     elif cap is None:
@@ -454,37 +727,53 @@ def _catalog_row(name, host, port, tag, removed, cap):
     else:
         cap_text = "Receiving, %s percent" % (_percent_text(cap.percent) or "0")
     return {
-        "name": str(name or host or ""),
+        "name": str(name or "").strip() or "—",
         "host": str(host or ""),
         "port": int(port or 0),
         "tag": str(tag or ""),
         "cap": cap_text,
+        "chain": {"xbt": "XBT", "xbtc": "XBTC"}.get(chain, "—"),
+        "pool_th": pool_th or "—",
+        "detail": detail or "",
+        "note": note or "",
+        "pubkey": str(pubkey or ""),
     }
 
 
 def _catalog_html(rows):
+    head = (
+        "<table><thead><tr><th>Name</th><th>Host</th><th>Port</th><th>Tag</th>"
+        "<th>Chain</th><th>Pool TH/s</th><th>Cap</th></tr></thead>"
+    )
     if not rows:
         return (
-            "<p class=\"note\">No pools have been read from the relays yet. "
+            head
+            + "</table><p class=\"note\">No pools have been read from the relays yet. "
             "The service reads them about once a minute.</p>"
         )
     lines = []
     for row in rows:
+        cap = row["cap"]
+        if row.get("detail"):
+            cap = "%s. %s." % (cap, row["detail"])
+        name = _esc(row["name"])
+        if row.get("note"):
+            name += "<div class=\"note\">%s</div>" % _esc(row["note"])
+        mark = " class=\"ours\"" if "This machine" in str(row.get("note") or "") else ""
         lines.append(
-            "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+            "<tr%s><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
             % (
-                _esc(row["name"]),
+                mark,
+                name,
                 _esc(row["host"]),
                 _esc(row["port"]),
                 _esc(row["tag"]),
-                _esc(row["cap"]),
+                _esc(row.get("chain") or "—"),
+                _esc(row.get("pool_th") or "—"),
+                _esc(cap),
             )
         )
-    return (
-        "<table><thead><tr><th>Name</th><th>Host</th><th>Port</th><th>Tag</th><th>Cap</th></tr></thead><tbody>"
-        + "".join(lines)
-        + "</tbody></table>"
-    )
+    return head + "<tbody>" + "".join(lines) + "</tbody></table>"
 
 
 def catalog_for_page(data_dir, config, now=None, websocket_factory=None):
@@ -508,10 +797,96 @@ def catalog_for_page(data_dir, config, now=None, websocket_factory=None):
             _save(data / "relay-cache.json", cache)
         except Exception:
             pass
-    return catalog_rows(cache, moment)
+    samples = _load(data / "sample-view.json", {})
+    if not isinstance(samples, dict):
+        samples = {}
+    identity = _read_identity(data)
+    pubkey = ""
+    if identity:
+        try:
+            pubkey = public_identity(identity)
+        except ValueError:
+            pubkey = ""
+    accepted = _accepted_publish(_load(data / _PUBLISH_FILE, {}))
+    return catalog_rows(
+        cache,
+        moment,
+        samples=samples,
+        rig_th=config.get("rig_th"),
+        ceiling=config.get("ceiling_percent"),
+        ours_pubkey=pubkey,
+        accepted=accepted,
+    )
 
 
-def config_page(config, publish=None, catalog=None):
+_ACTIVITY = {
+    "no-home": "No home yet. Pool Host stays where it is.",
+    "pinned": "Pool Host is pinned. It stays where it is.",
+    "not-opted-in": "Opt in is off. Pool Host stays where it is.",
+    "no-advertised-th": "Rig TH/s is zero. Pool Host stays where it is.",
+    "unmatched-owner-pool": "Saved home does not match a pool on the relays. Pool Host stays where it is.",
+    "stay-home": "Staying on the saved home Pool Host.",
+    "return-home": "Home fits again. Pool Host returns there.",
+    "home-dwell-expired": "The 30 minute wait on home ended. Home still fits.",
+    "spill": "Moved to a pool that still has room.",
+    "house-sink": "Moved to House Pool. Home and the other pools are over the cap.",
+    "still-house": "Still on House Pool.",
+    "dwell-house": "On House Pool. The 30 minute wait is still running.",
+    "dwell": "Staying on the current pool during the 30 minute wait.",
+    "dwell-home": "Staying on home during the 30 minute wait.",
+    "still-fits": "The current pool still has room.",
+    "no-choice": "No choice yet. The loop has not finished a read.",
+}
+
+
+def activity_sentence(activity, config):
+    """Plain last choice, plus the gateway Pool Host and the saved home."""
+    activity = activity if isinstance(activity, dict) else {}
+    parts = []
+    sentence = _ACTIVITY.get(str(activity.get("reason") or ""))
+    if sentence:
+        parts.append(sentence)
+    host = str(activity.get("gateway_host") or "").strip()
+    if host:
+        parts.append("Gateway Pool Host is %s:%s." % (host, activity.get("gateway_port") or ""))
+    home = (config or {}).get("home") or {}
+    if str(home.get("host") or "").strip():
+        parts.append("Saved home is %s:%s." % (home.get("host"), home.get("port")))
+    elif activity:
+        parts.append("Saved home is blank.")
+    return " ".join(parts)
+
+
+def chain_totals_text(samples, node_chain):
+    """One line for the XBT total and one for the XBTC total."""
+    samples = samples if isinstance(samples, dict) else {}
+    chains = samples.get("chains") if isinstance(samples.get("chains"), dict) else {}
+    sources = samples.get("sources") if isinstance(samples.get("sources"), dict) else {}
+    labels = {
+        "node": "this node",
+        "mempool.guide": "mempool.guide",
+        "mempool.xbtcash.org": "mempool.xbtcash.org",
+    }
+    parts = []
+    for key, title in (("xbt", "XBT"), ("xbtc", "XBTC")):
+        text = _th_text(chains.get(key))
+        source = labels.get(str(sources.get(key) or ""), "")
+        if text:
+            if source:
+                parts.append("%s total %s from %s" % (title, text, source))
+            else:
+                parts.append("%s total %s" % (title, text))
+    if not parts and samples.get("network_th") not in (None, ""):
+        text = _th_text(samples.get("network_th"))
+        if text:
+            where = "this node" if node_chain == "xbt" else "mempool.guide"
+            parts.append("XBT total %s from %s" % (text, where))
+    if not parts:
+        return "No chain total has been read yet. The loop reads it about once a minute."
+    return ". ".join(parts) + "."
+
+
+def config_page(config, publish=None, catalog=None, activity=None, samples=None, notice=""):
     """Local settings and pool publish page. Passwords and the private identity are not printed."""
     config = normalize_config(config)
     if not isinstance(publish, dict):
@@ -526,6 +901,14 @@ def config_page(config, publish=None, catalog=None):
     else:
         identity_note = "The 320-character private key is the file ratum-prime.key in the RATUM Prime service data. RATUM Prime writes that file the first time it starts. Show Pool Pubkey is the public key only. This page stores the key and does not show it again. After it is saved, this page shows the public 128-character pool key."
     message = str(publish.get("message") or "")
+    note = str(notice or "")
+    top = message or note
+    node_line = activity_sentence(activity, config)
+    if note:
+        node_line = (note + " " + node_line).strip()
+    chain_line = chain_totals_text(samples, config["node"]["chain"])
+    xbt_selected = "" if config["node"]["chain"] == "xbtc" else " selected"
+    xbtc_selected = " selected" if config["node"]["chain"] == "xbtc" else ""
     return """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -738,17 +1121,19 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, .choice:focus
 <div class="card danger">
 <p><strong>This form changes Pool Host.</strong> Use it only for the DATUM your own ASICs mine through. Do not paste the API address of a public pool. Opting that pool in would send every miner on it to some other pool.</p>
 </div>
+<p class="note">Your ASICs stay on the gateway miner port. This service only changes Pool Host.</p>
+<p class="status" id="node-result">%s</p>
 <details class="card guide" id="move-guide">
 <summary>Before this gateway can move<span>Nothing here is assumed. This page writes only Pool Host, port, and pubkey, and only after you opt in on your own mining DATUM.</span></summary>
 <ol>
 <li>Install a DATUM gateway on this machine for your own ASICs. Point each ASIC at that gateway miner port and leave it there. This service does not change the ASIC address. Never put port 28915 on an ASIC.</li>
-<li>On the DATUM dashboard open Interface, then Web UI, then Local. Copy the address and the API Listen Port. The gateway API address below is http:// plus that address and port.</li>
-<li>Copy the API Password from that same Local screen. The dashboard user is admin.</li>
-<li>Turn on Allow API Config Writes on the DATUM dashboard. This service cannot turn that switch on. Pool Host does not change while it is off.</li>
+<li>On the gateway service open Web Interface. Paste one Local https address into Gateway API address below. On Umbrel, when the gateway is RouteHash Gateway on this machine, that address is http://10.21.21.71:7152. The Listen Port on the API screen is the port inside the gateway. Leave it there.</li>
+<li>On the API screen, copy the Admin Password. The dashboard user is admin.</li>
+<li>Turn on Allow API Config Writes on that same API screen. This service cannot turn that switch on. Pool Host does not change while it is off.</li>
 <li>Paste the gateway API address and the API password below. Check the mining-DATUM box, then opt in. Local max percent is not a timer and it is not a cap on your rig. The 30-minute wait is separate. Leave it empty and this machine stores 30 percent of global XBT hashrate. The highest number is 30. A higher number is refused and the saved value stays. A pool publishes how much of the network it will hold. This number is how much of the network you will help one pool hold. This machine uses the lower of the two. Set Rig TH/s to the advertised figure. Zero stays on the saved Pool Host. Pin holds Pool Host still.</li>
 <li>Leave Home Pool Host blank. About once a minute this service reads Pool Host, port, and pubkey from the gateway and keeps that as home. It does not wait for a DATUM restart. The read needs the gateway API address and admin password. A typed host replaces the copy.</li>
 <li>House Pool is the last stop and is already filled in. Your ASICs stay on your gateway. When home does not fit and every receiving pool would go over its cap, this service points the gateway Pool Host here so the rig keeps hashing. After 30 minutes on House Pool, this service stays there until your home Pool Host fits again. Clear House Pool if you do not want that fallback.</li>
-<li>The relay box on this form is what this machine reads. Add your own relay on the next line, using the Start9 or Umbrel steps in Your own Nostr relay. Pool size is read from mempool.guide.</li>
+<li>The relay box on this form is what this machine reads. Add your own relay on the next line, using the Start9 or Umbrel steps in Your own Nostr relay. XBT pool size is read from mempool.guide. XBTC pool size is read from mempool.xbtcash.org.</li>
 </ol>
 </details>
 <form id="node-form" method="post" action="/">
@@ -778,17 +1163,18 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, .choice:focus
 <p class="danger"><strong>This is the DATUM that will be rewritten.</strong> Paste the API address of your own mining gateway. Do not paste the public pool.</p>
 <div class="field">
 <label>Gateway API address</label>
-<details class="help"><summary aria-label="Help">?</summary><p>On the DATUM dashboard open Interface, then Web UI, then Local. The address is http:// plus the host and API Listen Port shown there. An example is http://10.0.3.1:7152. This is not the Node RPC address. Blank does not write. Use the DATUM your own ASICs mine through.</p></details>
+<details class="help"><summary aria-label="Help">?</summary><p>On the gateway service open Web Interface. Paste one Local https address from that list. On Umbrel, when the gateway is RouteHash Gateway on this machine, that address is http://10.21.21.71:7152. The Listen Port on the API screen is the port inside the gateway. This is not the Node RPC address. A blank field keeps the address already saved, including one saved on the Local gateway screen. Use the DATUM your own ASICs mine through.</p></details>
 <input type="text" name="gateway_url" value="%s">
+<span class="note">Paste a Local https address from the gateway Web Interface. A blank field keeps the address already saved.</span>
 </div>
 <div class="field">
 <label>Gateway admin password</label>
-<details class="help"><summary aria-label="Help">?</summary><p>Paste the API Password from Interface, then Web UI, then Local. The dashboard user is admin. Turn on Allow API Config Writes on the DATUM dashboard. This service cannot turn that switch on. On this page a blank password keeps the saved one.</p></details>
+<details class="help"><summary aria-label="Help">?</summary><p>Paste the Admin Password from the API screen on the gateway. The dashboard user is admin. Turn on Allow API Config Writes on that same API screen. This service cannot turn that switch on. On this page a blank password keeps the saved one.</p></details>
 <input type="password" name="gateway_password" value="" autocomplete="off">
 <span class="note">%s</span>
 </div>
 </div>
-<div class="card">
+<div class="card" id="home-card">
 <h2>Home Pool Host</h2>
 <div class="field">
 <label>Pool Host</label>
@@ -807,6 +1193,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, .choice:focus
 <input type="text" name="home_pubkey" value="%s">
 </div>
 </div>
+<div class="actions"><button class="ghost" type="submit" name="form" value="copy-home">Copy the gateway Pool Host into Home</button></div>
+<p class="status" id="home-result">%s</p>
+<p class="note">Leave Pool Host blank. This button copies the Pool Host the gateway has right now into the fields on this card. Clearing a saved home does not read the gateway again.</p>
 </div>
 <div class="card">
 <h2>House Pool</h2>
@@ -831,7 +1220,16 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, .choice:focus
 </div>
 <div class="card">
 <h2>Global Blake2b Network</h2>
-<p class="note">Optional. This reads the global XBT hashrate from the Knots or Bitcoin Core node on this machine. When the RPC address is set, the total comes from that node. When it is blank, the total comes from mempool.guide. Pool size still comes from mempool.guide by coinbase tag.</p>
+<p class="note">Optional. This reads the chain total from the Knots or Bitcoin Core node on this machine. Pick the chain that node is on. When the RPC address is set, that chain total comes from the node. When it is blank, the XBT total comes from mempool.guide and the XBTC total comes from mempool.xbtcash.org. When it is blank, the total comes from mempool.guide.</p>
+<p class="status" id="chain-totals">%s</p>
+<div class="field">
+<label>Chain this node is on</label>
+<details class="help"><summary aria-label="Help">?</summary><p>Pick XBTC when this RPC is the XBTC Knots node. The number from that node is then the XBTC total. XBT pools use mempool.guide. XBTC pools use mempool.xbtcash.org when this node does not answer. One RPC is one chain.</p></details>
+<select name="node_chain">
+<option value="xbt"%s>XBT</option>
+<option value="xbtc"%s>XBTC</option>
+</select>
+</div>
 <div class="field">
 <label>Node RPC address</label>
 <details class="help"><summary aria-label="Help">?</summary><p>Optional. JSON-RPC of the Knots or Bitcoin Core node on this machine, such as http://10.0.3.1:8332. Use the RPC port that node shows. When this address is set, the global XBT hashrate comes from that node. When it is blank, the total comes from mempool.guide. This is not the DATUM gateway and not a Nostr relay.</p></details>
@@ -862,7 +1260,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, .choice:focus
 </div>
 <details class="card guide" id="list-guide">
 <summary>List your pool<span>Skip this form if you only run a DATUM gateway. Your rig can move without it.</span></summary>
-<p>The 320-character private key proves you own the pool. On StartOS it is the file ratum-prime.key in the RATUM Prime service data. DATUM Prime or RATUM writes that file the first time it starts and does not show it on screen. Show Pool Pubkey is the public key only. Pasting that public key cannot sign a cap, because anyone can read it. It is not the 128-character pool pubkey, and it is not a Nostr key. You do not paste a Nostr pubkey. A DATUM gateway does not have this file. Paste the key from that file once. This page stores it and does not show it again. After it is saved, this page shows the public 128-character pool key derived from it. This machine creates the Nostr key that only carries the events. The same DATUM identity signs the cap and the listing. This page sends the cap first. The listing is sent only after a relay accepts that cap. A listing with no cap does not move anyone. Name defaults to the host. Percent of global XBT hashrate on this form is the pool cap. A stats URL is optional, stored, and not fetched. Publish again within 24 hours. A cap lasts 24 hours and the listing lasts 7 days. Remove sends a cap that stops receiving, then a listing marked removed.</p>
+<p>The 320-character private key proves you own the pool. On StartOS it is the file ratum-prime.key in the RATUM Prime service data. DATUM Prime or RATUM writes that file the first time it starts and does not show it on screen. Show Pool Pubkey is the public key only. Pasting that public key cannot sign a cap, because anyone can read it. It is not the 128-character pool pubkey, and it is not a Nostr key. You do not paste a Nostr pubkey. A DATUM gateway does not have this file. Paste the key from that file once. This page stores it and does not show it again. After it is saved, this page shows the public 128-character pool key derived from it. This machine creates the Nostr key that only carries the events. The same DATUM identity signs the cap and the listing. This page sends the cap first. The listing is sent only after a relay accepts that cap. A listing with no cap does not move anyone. Name defaults to the host. Percent of global XBT hashrate on this form is the pool cap. A stats URL is optional, stored, and not fetched. A cap lasts 24 hours and the listing lasts 7 days. While this service is running it signs the last accepted cap again before those 24 hours end. An older cap that names a different host or port is ignored. Remove deletes the cap for this pool from those relays. The row leaves the table on the next read. A removal is not signed again.</p>
 </details>
 <form id="pool-form" method="post" action="/">
 <div class="card">
@@ -890,14 +1288,14 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, .choice:focus
 </div>
 <div class="field">
 <label>Coinbase tag</label>
-<details class="help"><summary aria-label="Help">?</summary><p>The tag this pool puts in the coinbase. Pool size is matched to this tag on mempool.guide. A missing or different tag is not a move target.</p></details>
+<details class="help"><summary aria-label="Help">?</summary><p>The tag this pool puts in the coinbase. Pool size is matched to this tag on mempool.guide for XBT and on mempool.xbtcash.org for XBTC. A missing or different tag is not a move target.</p></details>
 <input type="text" name="pool_tag" value="%s">
 </div>
 </div>
 <div class="grid2">
 <div class="field">
 <label>Percent of global XBT hashrate</label>
-<details class="help"><summary aria-label="Help">?</summary><p>This is the pool cap, a percent of global XBT hashrate. A chooser skips this pool when adding its Rig TH/s would put the pool over this percent, or over that chooser local max percent when that number is lower. The number does not change by itself when the global XBT hashrate changes. The global XBT hashrate turns the percent into TH. Publish again within 24 hours.</p></details>
+<details class="help"><summary aria-label="Help">?</summary><p>This is the pool cap, a percent of global XBT hashrate. A chooser skips this pool when adding its Rig TH/s would put the pool over this percent, or over that chooser local max percent when that number is lower. The number does not change by itself when the global XBT hashrate changes. The global XBT hashrate turns the percent into TH. While this service is running it signs this cap again before 24 hours.</p></details>
 <input type="text" name="pool_percent" value="%s">
 </div>
 <div class="field">
@@ -916,6 +1314,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, .choice:focus
 <details class="help"><summary aria-label="Help">?</summary><p>Where this page sends the cap and the listing. Add your own relay here too, with the Start9 or Umbrel address from Your own Nostr relay, under Pools on the relays. This list does not grow by itself. The cap is sent first. The listing is sent only after a relay accepts that cap.</p></details>
 <textarea name="pool_relays" rows="4">%s</textarea>
 </div>
+<p class="status" id="pool-result">%s</p>
 <div class="actions">
 <button class="primary" type="submit" name="form" value="publish">Publish cap and listing</button>
 <button class="ghost" type="submit" name="form" value="remove">Remove this pool</button>
@@ -931,13 +1330,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, .choice:focus
 </section>
 <div class="card">
 <h2>Relays this machine reads</h2>
-<p class="note">One address per line, ws:// or wss://. Install steps for Start9 and Umbrel are in Your own Nostr relay below. Add your own relay on the next line. This list does not grow by itself. Save node runner settings stores this list.</p>
+<p class="note">One address per line, ws:// or wss://. Install steps for Start9 and Umbrel are in Your own Nostr relay below. Add your own relay on the next line. This list does not grow by itself. Saving here stores the list this machine reads. It does not publish a pool.</p>
 <div class="field">
 <label>Relay URLs, one per line</label>
 <details class="help"><summary aria-label="Help">?</summary><p>The list starts with wss://relay.routehash.com. Add your own relay on the next line, as ws:// or wss://. This list does not grow by itself. This machine reads pools from every address in this list. Other machines see your pool when they already read one of those relays. A wss URL needs a certificate for that name. Start9 trusts its own certificate on the LAN. Turn Public on for StartTunnel, or forward the nostr port on your router, when other people should read your relay.</p></details>
 <textarea name="relays" form="node-form" rows="4">%s</textarea>
 </div>
-<div class="actions"><button class="primary" type="submit" form="node-form" name="form" value="save">Save node runner settings</button></div>
+<div class="actions"><button class="primary" type="submit" form="node-form" name="form" value="save">Save the relay list</button></div>
 </div>
 <details class="card guide" id="relay-guide">
 <summary>Your own Nostr relay<span>How to install a relay on Start9 or Umbrel, and why.</span></summary>
@@ -972,7 +1371,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, .choice:focus
   function show(hash) {
     var picked = "";
     if (hash === "#pool" || hash === "pool") picked = "pool";
-    if (hash === "#node" || hash === "node") picked = "node";
+    if (hash === "#node" || hash === "node" || hash === "#home-card") picked = "node";
     nodePanel.hidden = picked !== "node";
     poolPanel.hidden = picked !== "pool";
     nodeChoice.className = picked === "node" ? "choice on" : "choice";
@@ -988,10 +1387,29 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, .choice:focus
   }
   arm(nodeChoice, "node");
   arm(poolChoice, "pool");
-  window.addEventListener("hashchange", function () { show(location.hash); });
+  function focusHome() {
+    if (location.hash !== "#home-card") return;
+    var homeCard = document.getElementById("home-card");
+    if (homeCard && homeCard.scrollIntoView) homeCard.scrollIntoView();
+  }
+  window.addEventListener("hashchange", function () {
+    show(location.hash);
+    focusHome();
+  });
   show(location.hash);
+  focusHome();
   var form = document.getElementById("node-form");
+  var copyHome = false;
+  var copyButton = form.querySelector("button[value=copy-home]");
+  if (copyButton) {
+    copyButton.addEventListener("click", function () { copyHome = true; });
+  }
   form.addEventListener("submit", function (event) {
+    var submitter = event.submitter;
+    if (copyHome || (submitter && submitter.value === "copy-home")) {
+      copyHome = false;
+      return;
+    }
     var opt = form.querySelector("input[name=opt_in]");
     var ack = form.querySelector("input[name=own_gateway]");
     var block = document.getElementById("node-block");
@@ -1007,12 +1425,36 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, .choice:focus
       block.hidden = false;
     }
   });
+  var poolForm = document.getElementById("pool-form");
+  function publishReady() {
+    if (!poolForm) return;
+    var host = poolForm.querySelector("input[name=pool_host]");
+    var port = poolForm.querySelector("input[name=pool_port]");
+    var tag = poolForm.querySelector("input[name=pool_tag]");
+    var button = poolForm.querySelector("button[value=publish]");
+    if (!button) return;
+    var portOk = port && String(port.value).trim() !== "" && Number(port.value) >= 1 && Number(port.value) <= 65535;
+    var ready = host && host.value.trim() !== "" && tag && tag.value.trim() !== "" && portOk;
+    button.disabled = !ready;
+  }
+  if (poolForm) {
+    publishReady();
+    poolForm.addEventListener("input", publishReady);
+    var remove = poolForm.querySelector("button[value=remove]");
+    if (remove) {
+      remove.addEventListener("click", function (event) {
+        var ok = window.confirm("Remove deletes every cap this machine signed for this pool, including one just published.");
+        if (!ok) event.preventDefault();
+      });
+    }
+  }
 })();
 </script>
 </body>
 </html>
 """ % (
-        _esc(message),
+        _esc(top),
+        _esc(node_line),
         _checked(config["opt_in"]),
         _esc(config["ceiling_percent"]),
         _esc(config["rig_th"]),
@@ -1022,9 +1464,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, .choice:focus
         _esc(config["home"]["host"]),
         _esc(config["home"]["port"]),
         _esc(config["home"]["pubkey"]),
+        _esc(note),
         _esc(config["house"]["host"]),
         _esc(config["house"]["port"]),
         _esc(config["house"]["pubkey"]),
+        _esc(chain_line),
+        xbt_selected,
+        xbtc_selected,
         _esc(config["node"]["url"]),
         _esc(config["node"]["user"]),
         _esc(node_saved),
@@ -1037,6 +1483,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, .choice:focus
         _esc(publish.get("capacity") or ""),
         _esc(publish.get("stats_url") or ""),
         _esc(publish.get("relays") or ""),
+        _esc(message),
         _catalog_html(catalog),
         _esc(relays),
     )
@@ -1108,8 +1555,58 @@ def config_from_form(form, previous=None):
             "url": text("node_url", previous["node"]["url"]),
             "user": text("node_user", previous["node"]["user"]),
             "password": node_password,
+            "chain": text("node_chain", previous["node"]["chain"]),
         },
     })
+
+
+_GATEWAY_UNREAD = (
+    "This service could not read the saved Gateway API address. "
+    "The connection failed before a page was read. "
+    "Open the help on Gateway API address."
+)
+
+
+def config_for_copy(form, previous):
+    """Copy uses the saved gateway. A filled address or password on this page replaces it.
+
+    Other posted fields stay unsaved. A blank address keeps the one already stored,
+    including the address saved on the StartOS Local gateway screen.
+    """
+    config = normalize_config(previous or {})
+    url = _one(form, "gateway_url").strip()
+    password = _one(form, "gateway_password").strip()
+    if url:
+        config["gateway"]["url"] = url
+    if password:
+        config["gateway"]["password"] = password
+    return config
+
+
+def copy_gateway_home(data_dir, config, opener=None, pause=2.0):
+    """Replace Home with the Pool Host the gateway is using right now."""
+    config = normalize_config(config)
+    block = config["gateway"]
+    if not block["url"] or not block["password"]:
+        return config, "Set the gateway API address and password before copying Pool Host."
+    try:
+        gateway = DatumGatewayClient(block["url"], block["password"], opener=opener, pause=pause)
+    except ValueError:
+        return config, _GATEWAY_UNREAD
+    current = gateway.read() or {}
+    host = str(current.get("host") or "").strip()
+    if not host:
+        if gateway.last_error:
+            return config, _GATEWAY_UNREAD
+        return config, "The gateway did not return a Pool Host."
+    copied = dict(config)
+    copied["home"] = {
+        "host": host,
+        "port": _port(current.get("port"), 28915),
+        "pubkey": str(current.get("pubkey") or "").strip(),
+    }
+    copied["home_from_gateway"] = True
+    return save_config(data_dir, copied), "Home is now %s:%s from the gateway." % (host, copied["home"]["port"])
 
 
 def save_config(data_dir, config):
@@ -1149,6 +1646,13 @@ def cycle(data_dir, now=None, opener=None, websocket_factory=None, pause=2.0, sa
     """One choice. Returns the placement. Does not print the gateway password."""
     data = Path(data_dir)
     moment = time.time() if now is None else now
+    try:
+        renewed = renew_saved_pool(data_dir, now=moment, websocket_factory=websocket_factory)
+    except Exception as error:
+        print(json.dumps({"renewed": False, "error": type(error).__name__}), flush=True)
+    else:
+        if renewed:
+            print(json.dumps({"renewed": bool(renewed.get("renewed"))}), flush=True)
     config = normalize_config(_load(data / "chooser.json", {}))
     if (data / "pin").exists():
         config["pinned"] = True
@@ -1188,11 +1692,24 @@ def cycle(data_dir, now=None, opener=None, websocket_factory=None, pause=2.0, sa
     config["listings"] = listings
     placement, new_state = run_once(config, state, announcements, samples, gateway, moment)
     _save(data / "state.json", new_state)
+    seen = gateway.read() if gateway is not None else {}
+    if not isinstance(seen, dict):
+        seen = {}
     _save(data / "last.json", {
         "kind": placement.kind,
         "reason": placement.reason,
         "pool_id": placement.pool_id,
+        "gateway_host": str(seen.get("host") or ""),
+        "gateway_port": seen.get("port") or "",
     })
+    if isinstance(samples, dict):
+        _save(data / "sample-view.json", {
+            "network_th": samples.get("network_th"),
+            "pools": samples.get("pools") or {},
+            "pool_chain": samples.get("pool_chain") or {},
+            "chains": samples.get("chains") or {},
+            "sources": samples.get("sources") or {},
+        })
     return placement
 
 
@@ -1218,9 +1735,21 @@ def start_ui(data_dir, port):
                 return
             config = normalize_config(_load(data / "chooser.json", {}))
             catalog = catalog_for_page(data, config)
+            notice = _load(data / "notice.json", {})
+            notice_text = str(notice.get("message") or "") if isinstance(notice, dict) else ""
+            notice_path = data / "notice.json"
+            if notice_path.exists():
+                notice_path.unlink()
             self._send(
                 200,
-                config_page(config, publish_view(data, config), catalog),
+                config_page(
+                    config,
+                    publish_view(data, config),
+                    catalog,
+                    activity=_load(data / "last.json", {}),
+                    samples=_load(data / "sample-view.json", {}),
+                    notice=notice_text,
+                ),
                 "text/html; charset=utf-8",
             )
 
@@ -1236,6 +1765,20 @@ def start_ui(data_dir, port):
             form = parse_qs(raw, keep_blank_values=True)
             previous = normalize_config(_load(data / "chooser.json", {}))
             posted = _one(form, "form")
+            if posted == "copy-home":
+                posted_ceiling = _one(form, "ceiling_percent").strip()
+                if "ceiling_percent" in form and ceiling_refused(posted_ceiling):
+                    _save(data / "notice.json", {
+                        "message": "Local max percent cannot be above 30. The saved value was kept.",
+                    })
+                else:
+                    posted_config = config_for_copy(form, previous)
+                    _copied, copied_message = copy_gateway_home(data, posted_config, pause=0)
+                    _save(data / "notice.json", {"message": copied_message})
+                self.send_response(303)
+                self.send_header("Location", "/#home-card")
+                self.end_headers()
+                return
             if posted in {"publish", "remove"}:
                 publish_pool(data, form, previous)
                 target = "/#pool"

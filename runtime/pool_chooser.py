@@ -124,8 +124,9 @@ def _self_report(samples, tag):
 def doors_from_announcements(announcements, samples, ceiling, now, confirmed, listings=None):
     """One Door per consistent pubkey. Missing chain hashrate is not a target.
 
-    A pool listing alone does not become a move target. A cap that disagrees
-    with the current listing is left out.
+    A pool listing alone does not become a move target. A cap that names a
+    different host, port, or tag than the current listing is ignored. A cap
+    that matches the listing remains a target.
     """
     doors = []
     for cap in effective_caps(announcements, _unix(now), listings=listings).values():
@@ -136,6 +137,16 @@ def doors_from_announcements(announcements, samples, ceiling, now, confirmed, li
         percent = tighter_percent(cap.percent, ceiling) if cap.receive else None
         observed = (confirmed or {}).get(cap.pubkey)
         tag_ok = observed is None or observed == tag
+        chain = str(((samples or {}).get("pool_chain") or {}).get(tag) or "")
+        chain_total = ((samples or {}).get("chains") or {}).get(chain)
+        door_network = None
+        if chain_total not in (None, ""):
+            try:
+                door_network = float(chain_total)
+            except (TypeError, ValueError):
+                door_network = None
+            if door_network is not None and door_network <= 0:
+                door_network = None
         doors.append(Door(
             pool_id=pool_id_for(cap.pubkey),
             host=cap.host,
@@ -147,6 +158,7 @@ def doors_from_announcements(announcements, samples, ceiling, now, confirmed, li
             published_th=published,
             placed_th=0.0,
             spill_ok=bool(cap.receive and percent is not None and published is not None and tag_ok),
+            network_th=door_network,
         ))
     return doors
 

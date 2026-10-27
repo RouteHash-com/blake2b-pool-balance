@@ -89,11 +89,21 @@ def _rejected(body):
 
 
 def digest_opener(base_url, password):
-    """Digest auth as dashboard user admin, realm DATUM Gateway."""
+    """Digest auth as dashboard user admin, realm DATUM Gateway.
+
+    An https address is the StartOS box certificate. This client only talks
+    to the operator's own gateway, so that certificate is not checked.
+    """
     manager = HTTPPasswordMgrWithDefaultRealm()
     manager.add_password(_REALM, base_url, "admin", password)
     manager.add_password(None, base_url, "admin", password)
-    return build_opener(HTTPDigestAuthHandler(manager))
+    handlers = [HTTPDigestAuthHandler(manager)]
+    if urlsplit(base_url).scheme == "https":
+        import ssl
+        from urllib.request import HTTPSHandler
+
+        handlers.append(HTTPSHandler(context=ssl._create_unverified_context()))
+    return build_opener(*handlers)
 
 
 class DatumGatewayClient:
@@ -105,6 +115,7 @@ class DatumGatewayClient:
         self._opener = opener if opener is not None else digest_opener(self.base, password)
         self.pause = pause
         self.timeout = timeout
+        self.last_error = ""
 
     def __repr__(self):
         return "DatumGatewayClient(%r)" % (self.base,)
@@ -124,9 +135,11 @@ class DatumGatewayClient:
         return int(status or 0), payload
 
     def read(self):
+        self.last_error = ""
         try:
             _status, payload = self._exchange("GET", self.base + "/")
-        except Exception:
+        except Exception as error:
+            self.last_error = type(error).__name__
             return {}
         return parse_gateway_status(payload)
 

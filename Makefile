@@ -4,6 +4,8 @@ $(S9PK_MK): package.json
 	npm install
 include $(S9PK_MK)
 
-# start-cli pack loads ./javascript/index.js; list-ingredients may omit it.
-$(BASE_NAME)_%.s9pk: javascript/index.js
-$(BASE_NAME).s9pk: javascript/index.js
+# list-ingredients omits runtime/. An explicit rule merges into the pack recipe.
+# A second pattern rule does not.
+$(BASE_NAME)_x86_64.s9pk: $(wildcard runtime/*.py)
+$(BASE_NAME)_aarch64.s9pk: $(wildcard runtime/*.py)
+$(BASE_NAME).s9pk: $(wildcard runtime/*.py)

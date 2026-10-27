@@ -27,6 +27,7 @@ class Door:
     published_th: float | None = None
     placed_th: float = 0.0
     spill_ok: bool = False
+    network_th: float | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,20 @@ def effective_max_th(balance_receive, percent, capacity_th, network_th):
     if cap > 0:
         ceiling = min(ceiling, cap)
     return ceiling
+
+
+def door_network_th(door, network_th):
+    """A pool chain total wins. Callers without one keep the single network total."""
+    value = getattr(door, "network_th", None)
+    if value in (None, ""):
+        return network_th
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return network_th
+    if number <= 0:
+        return network_th
+    return number
 
 
 def pool_load_th(published_th, placed_th):
@@ -168,7 +183,9 @@ def _home_fits(home, rig_th, network_th, skipped, already_there):
         return False
     if not door.balance_receive:
         return True
-    max_th = effective_max_th(True, door.balance_max_percent, door.capacity_th, network_th)
+    max_th = effective_max_th(
+        True, door.balance_max_percent, door.capacity_th, door_network_th(door, network_th),
+    )
     if max_th is None or door.published_th is None:
         return True
     if already_there:
@@ -256,7 +273,10 @@ def select_balance_destination(
     if dwell and spill_kind == "house":
         return Placement("house", reason="dwell-house")
 
-    if _home_fits(home, rig_th, network_th, skipped, already_there=on_home):
+    if _home_fits(
+        home, rig_th, door_network_th(getattr(home, "door", None), network_th),
+        skipped, already_there=on_home,
+    ):
         if spill_kind in {"pool", "house"}:
             return _stay_home(home, reset_dwell=True, reason="return-home")
         if spill_kind == "home":
@@ -272,7 +292,7 @@ def select_balance_destination(
             and door.balance_receive
         ):
             max_th = effective_max_th(
-                True, door.balance_max_percent, door.capacity_th, network_th,
+                True, door.balance_max_percent, door.capacity_th, door_network_th(door, network_th),
             )
             if (
                 max_th is not None
@@ -295,7 +315,7 @@ def select_balance_destination(
         if spill_kind == "pool" and door.pool_id == spill_pool_id:
             continue
         max_th = effective_max_th(
-            True, door.balance_max_percent, door.capacity_th, network_th,
+            True, door.balance_max_percent, door.capacity_th, door_network_th(door, network_th),
         )
         fits, room = _new_fits(rig_th, max_th, door.published_th, door.placed_th)
         if not fits:

@@ -11,7 +11,7 @@ import time
 import uuid
 from pathlib import Path
 
-from directory_events import generate_identity, nostr_hex_to_npub, sign_event
+from directory_events import generate_identity, nostr_hex_to_npub, public_key_from_private, sign_event
 from pool_announce import (
     CAP_KIND,
     LISTING_KIND,
@@ -104,6 +104,20 @@ def listing_event(document, transport_private_key, now=None):
     return sign_event(event, transport_private_key)
 
 
+def _ok_for(socket, event_id):
+    """Read until this event's OK. An AUTH challenge is not the result."""
+    for _ in range(8):
+        response = json.loads(socket.recv())
+        if (
+            isinstance(response, list)
+            and len(response) >= 3
+            and response[0] == "OK"
+            and response[1] == event_id
+        ):
+            return response
+    return None
+
+
 def _deliver(event, relays, websocket_factory, timeout):
     """Send one event to every listed relay. One failure does not stop the rest."""
     urls = normalize_relays(relays)
@@ -116,12 +130,10 @@ def _deliver(event, relays, websocket_factory, timeout):
         try:
             socket = websocket_factory(relay, timeout=timeout)
             socket.send(message)
-            response = json.loads(socket.recv())
+            response = _ok_for(socket, event["id"])
             accepted = (
                 isinstance(response, list)
                 and len(response) >= 3
-                and response[0] == "OK"
-                and response[1] == event["id"]
                 and response[2] is True
             )
             results.append({"relay": relay, "accepted": accepted, "response": response})
@@ -145,6 +157,69 @@ def publish_caps(document, relays, transport_private_key, websocket_factory, tim
 def publish_listing(document, relays, transport_private_key, websocket_factory, timeout=10, now=None):
     """Send one pool listing to every listed relay."""
     event = listing_event(document, transport_private_key, now=now)
+    return event, _deliver(event, relays, websocket_factory, timeout)
+
+
+def pool_events_to_delete(events, pool_pubkey, transport_pubkey):
+    """Cap and listing ids this transport key published for one DATUM pubkey.
+
+    A matching event from another transport key is reported and left in place.
+    The relay only deletes an event for the key that signed it.
+    """
+    found = []
+    foreign = False
+    for event in events or ():
+        if not isinstance(event, dict) or event.get("kind") not in {CAP_KIND, LISTING_KIND}:
+            continue
+        content = event.get("content")
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)
+            except (TypeError, ValueError):
+                continue
+        payload = content.get("payload") if isinstance(content, dict) else None
+        if not isinstance(payload, dict) or str(payload.get("pool_pubkey") or "") != pool_pubkey:
+            continue
+        if str(event.get("pubkey") or "") != transport_pubkey:
+            foreign = True
+            continue
+        d_tag = ""
+        for tag in event.get("tags") or ():
+            if isinstance(tag, list) and len(tag) >= 2 and tag[0] == "d":
+                d_tag = str(tag[1])
+                break
+        found.append({"id": str(event.get("id") or ""), "kind": int(event.get("kind")), "d": d_tag})
+    return found, foreign
+
+
+def deletion_event(targets, transport_private_key, now=None):
+    """Kind 5 deletion for the cap and listing events this key published."""
+    current = int(time.time() if now is None else now)
+    author = public_key_from_private(transport_private_key)
+    tags = []
+    for item in targets or ():
+        event_id = str(item.get("id") or "")
+        if event_id:
+            tags.append(["e", event_id])
+        d_tag = str(item.get("d") or "")
+        kind = item.get("kind")
+        if d_tag and kind:
+            tags.append(["a", f"{int(kind)}:{author}:{d_tag}"])
+    if not tags:
+        raise ValueError("nothing to delete")
+    event = {
+        "pubkey": "",
+        "created_at": current,
+        "kind": 5,
+        "tags": tags,
+        "content": "",
+    }
+    return sign_event(event, transport_private_key)
+
+
+def publish_deletion(targets, relays, transport_private_key, websocket_factory, timeout=10, now=None):
+    """Delete prior caps and listings, then wait through AUTH for each OK."""
+    event = deletion_event(targets, transport_private_key, now=now)
     return event, _deliver(event, relays, websocket_factory, timeout)
 
 

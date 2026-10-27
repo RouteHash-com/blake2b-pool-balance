@@ -9,7 +9,7 @@ const spec = InputSpec.of({
   url: Value.text({
     name: i18n('API address'),
     description: i18n(
-      'On the DATUM dashboard open Interface, then Web UI, then Local. The address is http:// plus the host and API Listen Port shown there. An example is http://10.0.3.1:7152. This is not the Node RPC address. Blank does not write.',
+      'On the gateway service open Web Interface. Paste one Local https address from that list. The Listen Port on the API screen is the port inside the gateway. This is not the Node RPC address. On this screen a blank address clears the saved one.',
     ),
     required: false,
     default: '',
@@ -17,7 +17,7 @@ const spec = InputSpec.of({
   password: Value.text({
     name: i18n('Admin password'),
     description: i18n(
-      'Paste the API Password from Interface, then Web UI, then Local. The dashboard user is admin. Turn on Allow API Config Writes on the DATUM dashboard. This service cannot turn that switch on. On this screen a blank password clears the saved one, and then this service does not write.',
+      'Paste the Admin Password from the API screen on the gateway. The dashboard user is admin. Turn on Allow API Config Writes on that same API screen. This service cannot turn that switch on. On this screen a blank password clears the saved one, and then this service does not write.',
     ),
     required: false,
     default: '',
